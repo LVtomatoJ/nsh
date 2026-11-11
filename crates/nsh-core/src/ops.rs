@@ -261,6 +261,7 @@ events! {
     Wheel = "onWheel": "A mouse wheel or touchpad scrolled over the view (payload: [`EventPayload::Wheel`]): the nearest listener around the view under the pointer hears it; one nearer than any scroll view under the pointer takes the wheel, so nothing scrolls or zooms natively ([`crate::input::wheel_listener`]).",
 
     WebEvaluation = "onWebEvaluation" as "": "A native WebView evaluation reply (internal; payload: id and a JSON envelope string data).",
+    MouseUp = "onMouseUp": "A mouse button was released over the view or a view inside it (payload: [`EventPayload::Mouse`], its `button` naming the released one, with where and the modifiers). The primary button's release also reports `onPressUp`.",
 }
 
 /// What an input holds, for the system's autofill and suggestions
@@ -402,8 +403,9 @@ pub struct TouchPoint {
 }
 
 /// Where the mouse is over a view ([`EventKind::MouseEnter`],
-/// [`EventKind::MouseMove`], [`EventKind::MouseLeave`]), in points, as
-/// GPUI's `MouseMoveEvent`.
+/// [`EventKind::MouseMove`], [`EventKind::MouseLeave`]), and where a mouse
+/// button was released ([`EventKind::MouseUp`]), in points, as GPUI's
+/// `MouseMoveEvent`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 #[non_exhaustive]
 pub struct MouseEvent {
@@ -416,6 +418,9 @@ pub struct MouseEvent {
     pub modifiers: crate::keymap::Modifiers,
     /// The button held down, if any (a drag).
     pub pressed_button: Option<MouseButton>,
+    /// The button that changed at this event: the released one on
+    /// [`EventKind::MouseUp`], none on a move.
+    pub button: Option<MouseButton>,
 }
 
 impl MouseEvent {
@@ -432,6 +437,25 @@ impl MouseEvent {
             page_position,
             modifiers,
             pressed_button,
+            button: None,
+        }
+    }
+
+    /// A mouse button released at `position` in the view and
+    /// `page_position` in its root view, with `modifiers` held
+    /// ([`EventKind::MouseUp`]).
+    pub fn released(
+        position: Point<Points>,
+        page_position: Point<Points>,
+        modifiers: crate::keymap::Modifiers,
+        button: MouseButton,
+    ) -> Self {
+        Self {
+            position,
+            page_position,
+            modifiers,
+            pressed_button: None,
+            button: Some(button),
         }
     }
 }
@@ -920,7 +944,8 @@ pub enum EventPayload {
     /// Touches (`onTouch`).
     Touch(Box<TouchEvent>),
     /// The mouse over a view (`onMouseEnter`, `onMouseMove`,
-    /// `onMouseLeave`).
+    /// `onMouseLeave`) or a button released over it (`onMouseUp`, its
+    /// `button` naming the released one).
     Mouse(MouseEvent),
     /// A context menu asked for over a view (`onContextMenu`).
     ContextMenu(ContextMenuEvent),
@@ -2198,6 +2223,15 @@ pub enum Command {
         /// The call to answer.
         call: u32,
     },
+    /// Where a list's viewport starts among its rows, with this commit's
+    /// layout (`ref.measureScrollPosition()`): answered by the core in its
+    /// events for promise `call` (a [`crate::ListScrollPosition`], or null
+    /// for a view that is no list or a list without items); never
+    /// mounted.
+    MeasureScrollPosition {
+        /// The call to answer.
+        call: u32,
+    },
     /// Put `text` on the system clipboard (on the root; `Clipboard.writeText`).
     SetClipboard(String),
     /// Read the system clipboard and report it as [`EventKind::Clipboard`]
@@ -2312,6 +2346,17 @@ pub enum Command {
     HostCall {
         /// The call, echoed by the reply.
         id: u64,
+        /// The host's function.
+        name: String,
+        /// Its argument (any JSON value; `null` without one).
+        args: crate::JsonValue,
+    },
+    /// Hand `args` to function `name` of the app embedding NSH, with no
+    /// answer (on the root; `nsh/host`'s `host.post` without a native SDK
+    /// channel). Sent only on platforms whose
+    /// [`crate::platform::Environment::host`] is set, for functions the
+    /// app's `capabilities.host` grants.
+    HostPost {
         /// The host's function.
         name: String,
         /// Its argument (any JSON value; `null` without one).
@@ -3293,4 +3338,49 @@ pub enum Op {
     /// posted during a synchronous call ([`crate::element::RustCall`]). Never
     /// reaches a platform.
     Rust(crate::element::RustOp),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EventKind;
+
+    /// Android reads an event's kind by its index in [`EventKind::ALL`], so
+    /// `Native.java`'s codes must follow this order: a kind inserted here
+    /// and not there makes Android report the kinds after it as others.
+    #[test]
+    fn androids_event_codes_follow_the_kinds() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../nsh-platform-android/java/com/longbridge/nsh/Native.java"
+        );
+        let java = std::fs::read_to_string(path).expect("Native.java");
+        let codes: std::collections::HashMap<&str, usize> = java
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("static final int ")?;
+                let (name, value) = rest.strip_suffix(';')?.split_once(" = ")?;
+                Some((name, value.parse().ok()?))
+            })
+            .collect();
+        for (index, kind) in EventKind::ALL.iter().enumerate() {
+            let prop = kind.prop_name().trim_start_matches("on");
+            let mut name = String::new();
+            for (i, c) in prop.chars().enumerate() {
+                if c.is_ascii_uppercase() && i > 0 {
+                    name.push('_');
+                }
+                name.push(c.to_ascii_uppercase());
+            }
+            assert_eq!(
+                codes.get(name.as_str()),
+                Some(&index),
+                "Native.{name} for {kind:?}"
+            );
+        }
+        assert_eq!(
+            codes.len(),
+            EventKind::ALL.len(),
+            "Native.java has codes of no kind"
+        );
+    }
 }
